@@ -16,7 +16,7 @@ RUN mkdir -p \
 ENV SLEEP_DURATION=5s
 
 COPY --chown=buildpiper:buildpiper build.sh /home/buildpiper/build.sh
-COPY --chown=buildpiper:buildpiper build.sh /home/buildpiper/parse_zap.py
+COPY --chown=buildpiper:buildpiper parse_zap.py /home/buildpiper/parse_zap.py
 COPY --chown=buildpiper:buildpiper BP-BASE-SHELL-STEPS /opt/buildpiper/shell-functions/
 
 RUN chmod +x /home/buildpiper/build.sh && \
