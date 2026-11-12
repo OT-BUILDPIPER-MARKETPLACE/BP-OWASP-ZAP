@@ -1,8 +1,11 @@
+#!/usr/bin/env python3
 import csv
+import html
 import json
 import os
+import re
 import sys
-
+from datetime import datetime, timezone
 
 SEVERITY = {
     "INFO": 0,
@@ -12,510 +15,288 @@ SEVERITY = {
     "CRITICAL": 4,
 }
 
-
-def normalize_risk(risk):
-    """
-    Convert ZAP risk values into standard severity names.
-    """
-
-    risk = str(risk).upper().strip()
-
-    mapping = {
-        "INFORMATIONAL": "INFO",
-        "INFORMATION": "INFO",
-        "INFO": "INFO",
-        "LOW": "LOW",
-        "MEDIUM": "MEDIUM",
-        "HIGH": "HIGH",
-        "CRITICAL": "CRITICAL",
-    }
-
-    return mapping.get(risk, "INFO")
-
-
-def get_alert_url(alert):
-    """
-    Get the first affected URL from a ZAP alert.
-    """
-
-    instances = alert.get("instances", [])
-
-    if instances:
-        return instances[0].get("uri", "")
-
-    return ""
-
-
-def load_zap_report(report_file):
-    """
-    Load ZAP JSON report.
-    """
-
-    try:
-        with open(
-            report_file,
-            "r",
-            encoding="utf-8"
-        ) as file:
-            return json.load(file)
-
-    except FileNotFoundError:
-        print(
-            f"ERROR: ZAP report not found: {report_file}"
-        )
-        sys.exit(2)
-
-    except json.JSONDecodeError as error:
-        print(
-            f"ERROR: Invalid ZAP JSON: {error}"
-        )
-        sys.exit(2)
-
-
-def extract_findings(data):
-    """
-    Extract findings from ZAP JSON.
-    """
-
-    findings = []
-
-    for site in data.get("site", []):
-
-        site_name = site.get("name", "")
-
-        for alert in site.get("alerts", []):
-
-            risk = normalize_risk(
-                alert.get("riskdesc", "")
-            )
-
-            instances = alert.get("instances", [])
-
-            # Some ZAP reports may not contain instances.
-            if not instances:
-                instances = [{}]
-
-            for instance in instances:
-
-                url = instance.get(
-                    "uri",
-                    ""
-                )
-
-                findings.append(
-                    {
-                        "site": site_name,
-                        "risk": risk,
-                        "alert_name": alert.get(
-                            "name",
-                            ""
-                        ),
-                        "confidence": alert.get(
-                            "confidence",
-                            ""
-                        ),
-                        "url": url,
-                        "description": alert.get(
-                            "desc",
-                            ""
-                        ),
-                        "solution": alert.get(
-                            "solution",
-                            ""
-                        ),
-                        "reference": alert.get(
-                            "reference",
-                            ""
-                        ),
-                    }
-                )
-
-    return findings
-
-
-def calculate_counts(findings):
-    """
-    Calculate vulnerability counts by severity.
-    """
-
-    counts = {
-        "CRITICAL": 0,
-        "HIGH": 0,
-        "MEDIUM": 0,
-        "LOW": 0,
-        "INFO": 0,
-    }
-
-    for finding in findings:
-
-        risk = finding["risk"]
-
-        if risk in counts:
-            counts[risk] += 1
-
-    return counts
-
-
-def get_blocking_findings(findings, threshold):
-    """
-    Return findings that meet or exceed the configured threshold.
-    """
-
-    threshold_value = SEVERITY[threshold]
-
-    return [
-        finding
-        for finding in findings
-        if SEVERITY[finding["risk"]] >= threshold_value
-    ]
-
-
-def get_finding_status(finding, threshold):
-    """
-    Determine CSV status for an individual finding.
-    """
-
-    finding_value = SEVERITY[finding["risk"]]
-    threshold_value = SEVERITY[threshold]
-
-    if finding_value >= threshold_value:
-        return "FAIL"
-
-    if finding["risk"] == "MEDIUM":
-        return "WARN"
-
-    return "PASS"
-
-
-def write_csv(
-    csv_file,
-    findings,
-    threshold
-):
-    """
-    Generate CSV report.
-    """
-
-    os.makedirs(
-        os.path.dirname(csv_file) or ".",
-        exist_ok=True
-    )
-
-    fieldnames = [
-        "site",
-        "risk",
-        "alert_name",
-        "confidence",
-        "url",
-        "description",
-        "solution",
-        "reference",
-        "status",
-    ]
-
-    with open(
-        csv_file,
-        "w",
-        newline="",
-        encoding="utf-8"
-    ) as file:
-
-        writer = csv.DictWriter(
-            file,
-            fieldnames=fieldnames
-        )
-
-        writer.writeheader()
-
-        for finding in findings:
-
-            row = dict(finding)
-
-            row["status"] = get_finding_status(
-                finding,
-                threshold
-            )
-
-            writer.writerow(row)
-
-
-def print_summary(
-    counts,
-    threshold,
-    blocking_findings
-):
-    """
-    Print DAST summary.
-    """
-
-    print("")
-    print("======================================")
-    print("          DAST SCAN SUMMARY")
-    print("======================================")
-
-    print(
-        f"CRITICAL : {counts['CRITICAL']}"
-    )
-
-    print(
-        f"HIGH     : {counts['HIGH']}"
-    )
-
-    print(
-        f"MEDIUM   : {counts['MEDIUM']}"
-    )
-
-    print(
-        f"LOW      : {counts['LOW']}"
-    )
-
-    print(
-        f"INFO     : {counts['INFO']}"
-    )
-
-    print("--------------------------------------")
-
-    print(
-        f"Threshold          : {threshold}"
-    )
-
-    print(
-        f"Blocking findings  : "
-        f"{len(blocking_findings)}"
-    )
-
-    print("======================================")
-    print("")
-
-
-def handle_validation_failure(
-    blocking_findings
-):
-    """
-    Apply BuildPiper validation failure action.
-
-    WARN:
-        Print warning and continue pipeline.
-
-    FAIL:
-        Fail pipeline.
-
-    Any other value:
-        Configuration error.
-    """
-
-    action = os.getenv(
-        "VALIDATION_FAILURE_ACTION",
-        "FAIL"
+RISK_CODES = {
+    "-1": "INFO",
+    "0": "INFO",
+    "1": "LOW",
+    "2": "MEDIUM",
+    "3": "HIGH",
+    "4": "CRITICAL",
+}
+
+
+def clean(value):
+    value = html.unescape(str(value or ""))
+    value = re.sub(r"<[^>]*>", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def normalize_risk(alert):
+    risk = str(
+        alert.get("riskdesc") or alert.get("risk") or ""
     ).upper().strip()
 
-    if action == "WARN":
+    risk = risk.split("(", 1)[0].strip()
 
-        print(
-            "⚠️ DAST threshold breached"
-        )
+    if risk in SEVERITY:
+        return risk
 
-        print(
-            f"Blocking findings: "
-            f"{len(blocking_findings)}"
-        )
+    code = str(alert.get("riskcode", "")).strip()
+    return RISK_CODES.get(code, "INFO")
 
-        print(
-            "VALIDATION_FAILURE_ACTION=WARN"
-        )
 
-        print(
-            "Pipeline will continue."
-        )
+def load_report(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Unable to read ZAP JSON: {exc}") from exc
 
-        return 0
+    if not isinstance(data, dict):
+        raise ValueError("ZAP JSON root must be an object")
 
-    elif action == "FAIL":
+    if not isinstance(data.get("site", []), list):
+        raise ValueError("ZAP JSON site field must be a list")
 
-        print(
-            "❌ DAST threshold breached"
-        )
+    return data
 
-        print(
-            f"Blocking findings: "
-            f"{len(blocking_findings)}"
-        )
 
-        print(
-            "VALIDATION_FAILURE_ACTION=FAIL"
-        )
+def extract_findings(data, target_url):
+    findings = []
+    alert_groups = 0
 
-        print(
-            "Pipeline will stop."
-        )
+    for site in data.get("site", []) or []:
+        if not isinstance(site, dict):
+            continue
 
-        return 1
+        for alert in site.get("alerts", []) or []:
+            if not isinstance(alert, dict):
+                continue
 
+            alert_groups += 1
+            severity = normalize_risk(alert)
+            instances = alert.get("instances") or [{}]
+
+            for instance in instances:
+                if not isinstance(instance, dict):
+                    instance = {}
+
+                url = (
+                    instance.get("uri")
+                    or alert.get("url")
+                    or site.get("name")
+                    or target_url
+                )
+
+                reference = clean(alert.get("reference"))
+                match = re.search(r"https?://[^\s<>\"']+", reference)
+                documentation = match.group(0).rstrip(".,)") if match else reference
+
+                details = []
+                if instance.get("method"):
+                    details.append("Method: " + clean(instance["method"]))
+                if instance.get("param"):
+                    details.append("Param: " + clean(instance["param"]))
+                if instance.get("evidence"):
+                    details.append(
+                        "Evidence: " + clean(instance["evidence"])[:150]
+                    )
+
+                description = clean(alert.get("desc"))
+                if details:
+                    description = " | ".join(
+                        x for x in [description, " | ".join(details)] if x
+                    )
+
+                findings.append({
+                    "severity": severity,
+                    "plugin_id": str(alert.get("pluginid", "")),
+                    "title": clean(
+                        alert.get("alert")
+                        or alert.get("name")
+                        or "Unnamed ZAP alert"
+                    ),
+                    "url": str(url),
+                    "description": description,
+                    "solution": clean(alert.get("solution")),
+                    "documentation": documentation,
+                })
+
+    return findings, alert_groups
+
+
+def finding_status(severity, threshold):
+    if SEVERITY[severity] >= SEVERITY[threshold]:
+        return "Failed"
+
+    if severity in ("MEDIUM", "LOW"):
+        return "Warning"
+
+    return "Info"
+
+
+def write_csv(path, findings, threshold):
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+
+    headers = [
+        "S.No",
+        "Tool",
+        "Category",
+        "Status",
+        "Severity",
+        "Check ID",
+        "Title / Message",
+        "File",
+        "Line",
+        "Cause / Description",
+        "Recommendation / Fix",
+        "Documentation",
+    ]
+
+    rank = {
+        "CRITICAL": 0,
+        "HIGH": 1,
+        "MEDIUM": 2,
+        "LOW": 3,
+        "INFO": 4,
+    }
+    findings.sort(key=lambda item: rank[item["severity"]])
+
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f, quoting=csv.QUOTE_NONNUMERIC)
+        writer.writerow(headers)
+
+        for number, item in enumerate(findings, 1):
+            writer.writerow([
+                number,
+                "OWASP ZAP",
+                "DAST",
+                finding_status(item["severity"], threshold),
+                item["severity"],
+                item["plugin_id"],
+                item["title"],
+                "",  # File: DAST findings are URL-based
+                "",  # Line: DAST findings are URL-based
+                item["description"],
+                item["solution"],
+                item["documentation"],
+            ])
+
+
+def build_summary(findings, alert_groups, threshold, policy, csv_path):
+    counts = {severity: 0 for severity in SEVERITY}
+
+    for item in findings:
+        counts[item["severity"]] += 1
+
+    threshold_findings = sum(
+        1 for item in findings
+        if SEVERITY[item["severity"]] >= SEVERITY[threshold]
+    )
+
+    if threshold_findings and policy == "FAIL":
+        result = "FAIL"
+    elif threshold_findings:
+        result = "WARN"
     else:
+        result = "PASS"
 
-        print(
-            "ERROR: Invalid "
-            "VALIDATION_FAILURE_ACTION"
-        )
-
-        print(
-            f"Received: {action}"
-        )
-
-        print(
-            "Supported values: "
-            "WARN, FAIL"
-        )
-
-        return 2
+    return {
+        "scan": {
+            "alerts_count": alert_groups,
+            "findings_count": len(findings),
+            "severity_counts": counts,
+            "threshold": threshold,
+            "threshold_findings": threshold_findings,
+            "validation_failure_action": policy,
+            "finding_status": result,
+        },
+        "reports": {
+            "csv": csv_path,
+        },
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 def main():
-
-    # --------------------------------------------------
-    # Arguments
-    # --------------------------------------------------
-
-    if len(sys.argv) < 2:
-
+    if len(sys.argv) != 4:
         print(
-            "Usage:"
+            "Usage: parse_zap.py <zap.json> <output.csv> <summary.json>",
+            file=sys.stderr,
         )
+        return 2
 
-        print(
-            "python3 parse_zap.py "
-            "<zap-json> [csv-file]"
-        )
+    report_path, csv_path, summary_path = sys.argv[1:4]
 
-        sys.exit(2)
+    threshold = os.getenv("FAIL_ON", "HIGH").upper().strip()
+    if threshold == "INFORMATIONAL":
+        threshold = "INFO"
 
-    report_file = sys.argv[1]
-
-    csv_file = (
-        sys.argv[2]
-        if len(sys.argv) >= 3
-        else "/reports/dast-results.csv"
-    )
-
-    # --------------------------------------------------
-    # Environment configuration
-    # --------------------------------------------------
-
-    threshold = os.getenv(
-        "DAST_THRESHOLD",
-        "HIGH"
+    policy = os.getenv(
+        "VALIDATION_FAILURE_ACTION", "WARN"
     ).upper().strip()
 
-    # --------------------------------------------------
-    # Validate threshold
-    # --------------------------------------------------
+    if policy == "WARNING":
+        policy = "WARN"
 
     if threshold not in SEVERITY:
+        print(f"Invalid FAIL_ON value: {threshold}", file=sys.stderr)
+        return 2
 
+    if policy not in ("WARN", "FAIL"):
         print(
-            f"ERROR: Invalid DAST_THRESHOLD: "
-            f"{threshold}"
+            "VALIDATION_FAILURE_ACTION must be WARN or FAIL",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        data = load_report(report_path)
+        findings, alert_groups = extract_findings(
+            data, os.getenv("TARGET_URL", "")
         )
 
-        print(
-            "Supported values: "
-            "CRITICAL, HIGH, MEDIUM, LOW, INFO"
+        write_csv(csv_path, findings, threshold)
+
+        summary = build_summary(
+            findings, alert_groups, threshold, policy, csv_path
         )
 
-        sys.exit(2)
-
-    # --------------------------------------------------
-    # Load ZAP JSON
-    # --------------------------------------------------
-
-    print(
-        f"Reading ZAP report: {report_file}"
-    )
-
-    data = load_zap_report(
-        report_file
-    )
-
-    # --------------------------------------------------
-    # Extract findings
-    # --------------------------------------------------
-
-    findings = extract_findings(
-        data
-    )
-
-    # --------------------------------------------------
-    # Calculate counts
-    # --------------------------------------------------
-
-    counts = calculate_counts(
-        findings
-    )
-
-    # --------------------------------------------------
-    # Determine blocking findings
-    # --------------------------------------------------
-
-    blocking_findings = (
-        get_blocking_findings(
-            findings,
-            threshold
-        )
-    )
-
-    # --------------------------------------------------
-    # Generate CSV
-    # --------------------------------------------------
-
-    write_csv(
-        csv_file,
-        findings,
-        threshold
-    )
-
-    print(
-        f"CSV report generated: {csv_file}"
-    )
-
-    # --------------------------------------------------
-    # Print summary
-    # --------------------------------------------------
-
-    print_summary(
-        counts,
-        threshold,
-        blocking_findings
-    )
-
-    # --------------------------------------------------
-    # Validation / Pipeline decision
-    # --------------------------------------------------
-
-    if blocking_findings:
-
-        exit_code = (
-            handle_validation_failure(
-                blocking_findings
-            )
+        os.makedirs(
+            os.path.dirname(os.path.abspath(summary_path)),
+            exist_ok=True,
         )
 
-        sys.exit(exit_code)
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
 
-    # --------------------------------------------------
-    # No threshold breach
-    # --------------------------------------------------
+    except (ValueError, OSError, TypeError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
 
-    print(
-        "✅ DAST RESULT: PASSED"
-    )
+    scan = summary["scan"]
 
-    print(
-        "No findings met or exceeded "
-        f"the {threshold} threshold."
-    )
+    print("\n========== OWASP ZAP DAST SUMMARY ==========")
+    print(f"Alert groups       : {scan['alerts_count']}")
+    print(f"Finding instances  : {scan['findings_count']}")
 
-    sys.exit(0)
+    for severity, count in scan["severity_counts"].items():
+        print(f"{severity:12}: {count}")
+
+    print(f"Threshold          : {threshold}")
+    print(f"Threshold findings : {scan['threshold_findings']}")
+    print(f"Policy             : {policy}")
+    print(f"Result             : {scan['finding_status']}")
+    print(f"CSV                : {csv_path}")
+    print(f"Summary            : {summary_path}")
+    print("============================================")
+
+    if scan["threshold_findings"] and policy == "FAIL":
+        return 1
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
